@@ -17,6 +17,7 @@ import os
 import queue
 import threading
 import time
+import requests
 
 import numpy as np
 import pandas as pd
@@ -36,9 +37,8 @@ except Exception:
 API_BASE = os.environ.get("EEG_API_BASE", "http://localhost:8000")
 WS_BASE = os.environ.get("EEG_WS_BASE", "ws://localhost:8000/ws/eeg")
 
-import requests
 
-GEMINI_API_KEY = ""
+GEMINI_API_KEY = "AIzaSyCqXa8wTLG8mKJXStEngTnte5aWVABKyz8"
 GEMINI_MODEL = "gemini-1.5-flash"
 
 def gemini_interpret(pred_label, conf, band_summary):
@@ -72,23 +72,11 @@ Format:
         return f"- Gemini interpretation unavailable\n- Error: {e}"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 SAMPLE_RATE = 128
 FFT_SIZE = 256
 DISPLAY_BUFFER = 2048   # how many samples we keep per channel
 PLOT_WINDOW = 512       # how many points to draw per channel (scroll width)
-REFRESH_DEFAULT = 0.5   # seconds
+REFRESH_DEFAULT = 2.0   # seconds
 
 DETECTION_MODES = {
     "alzheimer": ["Pz", "P3", "P4", "O1", "O2", "Cz"],
@@ -410,11 +398,11 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.markdown("Backend")
-    st.markdown(f"- API: `{API_BASE}`")
-    st.markdown(f"- WS: `{WS_BASE}`")
-    if st.session_state.ws_error:
-        st.error(f"WS: {st.session_state.ws_error}")
+    # st.markdown("Backend")
+    # st.markdown(f"- API: `{API_BASE}`")
+    # st.markdown(f"- WS: `{WS_BASE}`")
+    # if st.session_state.ws_error:
+    #     st.error(f"WS: {st.session_state.ws_error}")
 
 # initialize buffers for current mode
 init_buffers_for_mode(st.session_state.current_mode)
@@ -555,3 +543,5 @@ with right_col:
 if st.session_state.auto_refresh:
     time.sleep(float(st.session_state.refresh_rate))
     st.rerun()
+
+
