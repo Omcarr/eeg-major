@@ -1,62 +1,39 @@
+# ui.py
 """
-Classic EEG stacked Streamlit dashboard (single file).
-Features:
- - Polls Redis backend via HTTP for live data (no WebSocket needed)
- - ESP32-friendly: no broadcast overload
- - Classic vertical stacked EEG waveforms
- - Band-power cards and predictions
- - ONLY USES REAL BACKEND DATA
+Complete Streamlit UI (single-file) for EEG Real-Time Multi-Disorder Detection
++ Alpha-based Emotional State module (Option A: keep disorder prediction and add emotion block)
+Includes an example embedded image (from uploaded file path).
 """
 
 from collections import deque
 import os
 import time
 import requests
+import json
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from scipy import signal
-from scipy.stats import kurtosis, skew
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 API_BASE = os.environ.get("EEG_API_BASE", "http://localhost:8000")
 
-GEMINI_API_KEY = "AIzaSyCqXa8wTLG8mKJXStEngTnte5aWVABKyz8"
-GEMINI_MODEL = "gemini-1.5-flash"
+# ---- Gemini (prefer env var; fallback to placeholder) ----
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyCqXa8wTLG8mKJXStEngTnte5aWVABKyz8")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
 
-def gemini_interpret(pred_label, conf, band_summary):
-    """Generate a short, formatted interpretation using Gemini."""
-    prompt = f"""
-You are an EEG analysis assistant.
-
-Prediction: {pred_label}
-Confidence: {conf:.2f}
-Band summary: {band_summary}
-
-Write a VERY SHORT interpretation (2–3 lines), concise, professional, no filler.
-Format:
-- Insight 1
-- Insight 2
-"""
-
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        headers = {"Content-Type": "application/json"}
-        payload = {"contents": [{"parts":[{"text": prompt}]}]}
-
-        res = requests.post(url, headers=headers, json=payload, timeout=5)
-        data = res.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return text.strip()
-    except Exception as e:
-        return f"- Gemini interpretation unavailable\n- Error: {e}"
-
+# Path to uploaded image (provided by developer/instruction)
+# EXAMPLE_IMAGE_PATH = "/mnt/data/e51ad7c5-dc98-43fd-8ad9-35025a7ad699.png"
 
 SAMPLE_RATE = 128
 FFT_SIZE = 256
 PLOT_WINDOW = 512
-REFRESH_DEFAULT = 0.5
+REFRESH_DEFAULT = 2.0
 
 DETECTION_MODES = {
     "alzheimer": ["Pz", "P3", "P4", "O1", "O2", "Cz"],
@@ -73,7 +50,7 @@ BANDS = {
     "theta": (4, 8),
     "alpha": (8, 13),
     "beta": (13, 30),
-    "gamma": (30, 50)
+    "gamma": (30, 50),
 }
 
 BAND_COLORS = {
@@ -81,89 +58,24 @@ BAND_COLORS = {
     "theta": "#ff9800",
     "alpha": "#4caf50",
     "beta": "#2196f3",
-    "gamma": "#9c27b0"
+    "gamma": "#9c27b0",
 }
 
-# ---------- Streamlit session state initialization ----------
-if "initialized" not in st.session_state:
-    st.session_state.initialized = True
-    st.session_state.current_mode = "alzheimer"
-    st.session_state.auto_refresh = True
-    st.session_state.refresh_rate = REFRESH_DEFAULT
-    st.session_state.buffer_ready = False
-    st.session_state.prediction_result = None
-    st.session_state.last_buffer_status = {}
-    st.session_state.last_data_time = 0
-    st.session_state.backend_status = "unknown"
+EMOTIONS = ["Relaxed", "Focused", "Stressed", "Drowsy"]
 
+# ============================================================
+# HELPERS: SIGNAL PROCESSING & BANDS
+# ============================================================
 
-# ---------- API functions ----------
-def get_mode_from_api():
-    try:
-        r = requests.get(f"{API_BASE}/api/mode", timeout=1.0)
-        if r.ok:
-            return r.json().get("mode", st.session_state.current_mode), r.json().get("channels", DETECTION_MODES.get(st.session_state.current_mode))
-    except Exception:
-        pass
-    return st.session_state.current_mode, DETECTION_MODES[st.session_state.current_mode]
-
-
-def set_mode_api(mode):
-    try:
-        r = requests.post(f"{API_BASE}/api/set_mode/{mode}", timeout=3.0)
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def get_live_data(samples=512):
-    """Get latest samples from Redis backend"""
-    try:
-        r = requests.get(f"{API_BASE}/api/live_data", params={"samples": samples}, timeout=2.0)
-        if r.ok:
-            return r.json()
-    except Exception as e:
-        st.session_state.backend_status = f"error: {e}"
-    return None
-
-
-def get_buffer_status():
-    try:
-        r = requests.get(f"{API_BASE}/api/buffer", timeout=1.0)
-        if r.ok:
-            st.session_state.backend_status = "connected"
-            return r.json()
-    except Exception as e:
-        st.session_state.backend_status = f"error: {e}"
-    return {"ready": False, "samples": {}}
-
-
-def call_predict_api():
-    try:
-        r = requests.post(f"{API_BASE}/api/predict", timeout=10.0)
-        if r.ok:
-            return r.json()
-        else:
-            return {"error": f"HTTP {r.status_code}: {r.text}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def call_clear_api():
-    try:
-        requests.post(f"{API_BASE}/api/clear", timeout=2.0)
-        return True
-    except Exception:
-        return False
-
-
-# signal processing
 def compute_psd_welch(samples):
     if len(samples) < 8:
         return np.array([]), np.array([])
-    freqs, psd = signal.welch(np.asarray(samples[-FFT_SIZE:]), fs=SAMPLE_RATE, nperseg=min(FFT_SIZE, len(samples)))
+    freqs, psd = signal.welch(
+        np.asarray(samples[-FFT_SIZE:]),
+        fs=SAMPLE_RATE,
+        nperseg=min(FFT_SIZE, len(samples)),
+    )
     return freqs, psd
-
 
 def compute_band_powers(samples):
     freqs, psd = compute_psd_welch(samples)
@@ -173,239 +85,403 @@ def compute_band_powers(samples):
             out[b] = {"power": 0.0, "relative": 0.0}
         out["_total"] = 0.0
         return out
+
     total = float(np.trapz(psd, freqs))
     if total <= 0:
         total = 1e-12
+
     for b, (lo, hi) in BANDS.items():
         idx = (freqs >= lo) & (freqs <= hi)
-        p = float(np.trapz(psd[idx], freqs[idx])) if np.any(idx) else 0.0
+        p = float(np.trapz(psd[idx], freqs[idx])) if idx.any() else 0.0
         out[b] = {"power": p, "relative": p / total}
+
     out["_total"] = total
     return out
 
+def summarize_bands_for_interpretation(channel_data):
+    """Compute mean band powers and relative values across channels."""
+    band_power = {b: [] for b in BANDS.keys()}
+    band_rel = {b: [] for b in BANDS.keys()}
 
-# ---------- UI building ----------
-st.set_page_config(page_title="EEG Multi-Disorder Detection", page_icon="🧠", layout="wide")
+    for ch, samples in channel_data.items():
+        bp = compute_band_powers(samples)
+        for b in BANDS.keys():
+            band_power[b].append(bp[b]["power"])
+            band_rel[b].append(bp[b]["relative"])
+
+    summary = {}
+    for b in BANDS.keys():
+        summary[b] = {
+            "mean_power": float(np.mean(band_power[b])) if band_power[b] else 0.0,
+            "mean_relative": float(np.mean(band_rel[b])) if band_rel[b] else 0.0,
+        }
+    return summary
+
+# ============================================================
+# EMOTIONAL STATE MODEL (ALPHA-DRIVEN)
+# ============================================================
+
+def compute_emotion_distribution(alpha_rel):
+    """
+    Heuristic probability distribution over emotional states based on alpha relative power.
+    alpha_rel: float in [0,1] — mean relative alpha power across relevant channels.
+    Returns dict of emotion -> probability (sums to 1).
+    """
+    # Heuristic: alpha increase -> more relaxed/drowsy; alpha decrease -> more focused/stressed
+    relaxed = alpha_rel * 0.55 + 0.05        # scales with alpha
+    drowsy = alpha_rel * 0.30 + 0.02         # scales with alpha
+    # complementary mass distributed to focused/stressed
+    focused = (1 - alpha_rel) * 0.45 + 0.02
+    stressed = (1 - alpha_rel) * 0.25 + 0.02
+
+    raw = np.array([relaxed, focused, stressed, drowsy])
+    probs = raw / raw.sum()
+    return {emo: float(probs[i]) for i, emo in enumerate(EMOTIONS)}
+
+def gemini_emotion_interpret(alpha_level, emotion_probs):
+    """
+    Short 2-3 line emotional interpretation via Gemini (if available).
+    Falls back to a concise local string on error.
+    """
+    # prompt = (
+    #     "You are an EEG emotional-state assistant.\n"
+    #     f"Alpha relative intensity: {alpha_level:.3f}\n"
+    #     f"Emotion distribution: {json.dumps(emotion_probs)}\n\n"
+    #     "Write a VERY SHORT 2–3 line clinical-style interpretation of the user's current "
+    #     "emotional state based primarily on alpha activity. Keep it concise and actionable.\n"
+    #     "Format:\n- Line1\n- Line2\n"
+    # )
+
+    # try:
+    #     url = (
+    #         f"https://generativelanguage.googleapis.com/v1beta/models/"
+    #         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    #     )
+    #     headers = {"Content-Type": "application/json"}
+    #     payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    #     res = requests.post(url, headers=headers, json=payload, timeout=6)
+    #     data = res.json()
+    #     # defensive access
+    #     text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+    #     if not text:
+    #         raise ValueError("Empty response from Gemini")
+    #     return text.strip()
+    # except Exception as e:
+    #     # Provide a compact fallback interpretation
+    #     top = max(emotion_probs.items(), key=lambda x: x[1])
+    #     fallback = [
+    #         f"- Dominant emotional state: {top[0]} ({top[1]*100:.1f}%).",
+    #         f"- Alpha level suggests {('higher' if alpha_level>0.15 else 'lower')} cortical alpha activation."
+    #     ]
+    #     return "\n".join(fallback) + f"\n- Gemini error: {e}"
+    top = max(emotion_probs.items(), key=lambda x: x[1])
+    fallback = [
+        f"- Dominant emotional state: {top[0]} ({top[1]*100:.1f}%).",
+        f"- Alpha level suggests {('higher' if alpha_level>0.15 else 'lower')} cortical alpha activation."
+    ]
+    return "\n".join(fallback)
+
+# ============================================================
+# API FUNCTIONS
+# ============================================================
+
+def set_mode_api(mode):
+    try:
+        r = requests.post(f"{API_BASE}/api/set_mode/{mode}", timeout=3)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+def get_live_data(samples=512):
+    try:
+        r = requests.get(f"{API_BASE}/api/live_data", params={"samples": samples}, timeout=3)
+        if r.ok:
+            return r.json()
+    except:
+        pass
+    return None
+
+def get_buffer_status():
+    try:
+        r = requests.get(f"{API_BASE}/api/buffer", timeout=1)
+        if r.ok:
+            return r.json()
+    except:
+        pass
+    return {"ready": False, "samples": {}}
+
+def call_predict_api():
+    try:
+        r = requests.post(f"{API_BASE}/api/predict", timeout=10)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+def call_clear_api():
+    try:
+        requests.post(f"{API_BASE}/api/clear", timeout=3)
+        return True
+    except:
+        return False
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "initialized" not in st.session_state:
+    st.session_state.initialized = True
+    st.session_state.current_mode = "alzheimer"
+    st.session_state.auto_refresh = True
+    st.session_state.refresh_rate = REFRESH_DEFAULT
+    st.session_state.prediction_result = None
+
+# ============================================================
+# UI SETUP
+# ============================================================
+
+st.set_page_config(page_title="EEG Multi-Disorder Detection + Emotion", page_icon="🧠", layout="wide")
 st.markdown("# EEG Real-Time Multi-Disorder Detection")
-# st.markdown("Classic stacked EEG view — live waveforms from Redis buffer")
 
-# Sidebar
 with st.sidebar:
     st.header("Controls")
     mode_select = st.selectbox(
         "Detection Mode",
         options=list(DETECTION_MODES.keys()),
         index=list(DETECTION_MODES.keys()).index(st.session_state.current_mode),
-        format_func=lambda x: x.title()
     )
     if st.button("Apply Mode"):
-        res = set_mode_api(mode_select)
+        set_mode_api(mode_select)
         st.session_state.current_mode = mode_select
         st.success(f"Mode set to {mode_select}")
         st.rerun()
 
-    st.divider()
-    
-    # Auto refresh controls
-    st.session_state.auto_refresh = st.checkbox("Auto refresh UI", value=st.session_state.auto_refresh)
-    st.session_state.refresh_rate = st.slider(
-        "Refresh interval (s)",
-        min_value=0.2,
-        max_value=2.0,
-        step=0.1,
-        value=float(st.session_state.refresh_rate)
-    )
+    st.session_state.auto_refresh = st.checkbox("Auto-refresh", st.session_state.auto_refresh)
+    st.session_state.refresh_rate = st.slider("Refresh interval", 0.2, 5.0, st.session_state.refresh_rate, 0.1)
 
-    st.divider()
-    
-    # Actions
-    if st.button("Predict Now"):
+    if st.button("Predict"):
         st.session_state.prediction_result = call_predict_api()
         st.rerun()
-        
-    if st.button("Clear Buffers"):
+
+    if st.button("Clear buffers"):
         call_clear_api()
         st.session_state.prediction_result = None
-        st.success("Cleared buffers")
         st.rerun()
 
-channels = list(DETECTION_MODES[st.session_state.current_mode])
 
-live_data_response = get_live_data(samples=PLOT_WINDOW)
-channel_data = {}
-has_live_data = False
+# ============================================================
+# Live Data Acquisition
+# ============================================================
 
-if live_data_response:
-    st.session_state.last_data_time = time.time()
-    channel_data = live_data_response.get("data", {})
-    has_live_data = bool(channel_data)
+channels = DETECTION_MODES[st.session_state.current_mode]
+live_data = get_live_data(samples=PLOT_WINDOW)
+channel_data = live_data.get("data", {}) if live_data else {}
+ready = get_buffer_status().get("ready", False)
 
-server_buf = get_buffer_status()
-st.session_state.buffer_ready = server_buf.get("ready", False)
-st.session_state.last_buffer_status = server_buf.get("samples", {})
+st.markdown("## Live EEG Signals")
 
-st.markdown("## Live EEG data")
-
-# Show warning if no data
-if not has_live_data:
-    st.warning("⚠️ No data from backend. Make sure ESP32 is connected and sending data.")
+if not channel_data:
+    st.warning("Waiting for live EEG data from backend... (UI will show zeros until data arrives)")
 
 left_col, right_col = st.columns([3, 1])
 
+# ============================================================
+# LEFT COLUMN – EEG WAVEFORMS + BAND CARDS
+# ============================================================
+
 with left_col:
-    # Render each channel stacked vertically
+    # Plot each configured channel as a stacked waveform
     for ch in channels:
-        # Get data for this channel (Redis returns newest first)
         y = channel_data.get(ch, [])
         has_data = len(y) > 0
-        
-        # Redis returns newest first, so reverse for chronological display
+
         if has_data:
+            # ensure list length
             y = list(reversed(y[:PLOT_WINDOW]))
             x = list(range(len(y)))
         else:
             x = list(range(PLOT_WINDOW))
             y = [0.0] * PLOT_WINDOW
 
-        # Auto-scale with padding
-        if has_data and any(y):
-            mn = min(y)
-            mx = max(y)
-            pad = (mx - mn) * 0.25 if (mx - mn) != 0 else 1.0
-            ymin = mn - pad
-            ymax = mx + pad
-        else:
-            ymin, ymax = -10, 10
-
         fig = go.Figure()
-        
-        # Waveform
-        line_color = "#00e676" if has_data else "#404040"
-        fig.add_trace(go.Scatter(
-            x=x, y=y,
-            mode="lines",
-            line=dict(color=line_color, width=1.6),
-            hoverinfo="skip"
-        ))
-        
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color="#00e676", width=1.4)))
+
+        mn, mx = min(y), max(y)
+        pad = (mx - mn) * 0.25 if (mx - mn) else 1
         fig.update_layout(
             height=130,
-            margin=dict(l=30, r=8, t=6, b=6),
+            margin=dict(l=25, r=10, t=5, b=5),
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(2,6,12,0.6)",
             xaxis=dict(visible=False),
-            yaxis=dict(
-                range=[ymin, ymax],
-                showgrid=True,
-                gridcolor="rgba(255,255,255,0.03)",
-                tickfont=dict(color="#9ab")
-            ),
-            showlegend=False
+            yaxis=dict(range=[mn - pad, mx + pad], showgrid=True, gridcolor="rgba(255,255,255,0.03)"),
         )
-        
-        # Channel label with status
-        status_dot = "🟢" if has_data else "⚪"
+
         fig.update_layout(annotations=[dict(
             x=0.005, y=0.5,
             xref="paper", yref="paper",
-            text=f"<b style='color:#bfefff'>{status_dot} {ch}</b>",
+            text=f"🧩 <b>{ch}</b>",
+            font=dict(color="#bfefff"),
             showarrow=False,
-            xanchor="left",
-            font=dict(size=13)
+            xanchor="left"
         )])
-        
-        # "Waiting" message if no data
-        if not has_data:
-            fig.add_annotation(
-                x=0.5, y=0.5,
-                xref="paper", yref="paper",
-                text="Waiting for data from ESP32...",
-                showarrow=False,
-                font=dict(size=11, color="#666"),
-                xanchor="center"
-            )
-        
+
         st.plotly_chart(fig, use_container_width=True)
 
-        # Band-power cards (only if we have data)
+        # Band-power cards
         if has_data:
             bp = compute_band_powers(y)
             cols = st.columns(len(BANDS))
-            for i, band in enumerate(BANDS.keys()):
+            for i, b in enumerate(BANDS.keys()):
                 with cols[i]:
-                    info = bp[band]
-                    rel_pct = info["relative"] * 100
+                    p = bp[b]["power"]
+                    rel = bp[b]["relative"] * 100
                     st.markdown(
                         f"""
-                        <div style="background:#071226;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.03)">
-                            <div style="font-weight:700;color:{BAND_COLORS[band]};text-transform:uppercase">{band}</div>
-                            <div style="font-size:12px;color:#9ab;margin-top:6px">{info['power']:.2e}</div>
-                            <div style="height:8px;background:rgba(255,255,255,0.04);border-radius:4px;margin-top:6px;overflow:hidden">
-                                <div style="width:{rel_pct:.2f}%;background:{BAND_COLORS[band]};height:100%"></div>
+                        <div style="background:#081420;padding:8px;border-radius:8px">
+                            <div style="color:{BAND_COLORS[b]};font-weight:700;text-transform:uppercase">{b}</div>
+                            <div style="font-size:12px;color:#9ab">{p:.2e}</div>
+                            <div style="height:8px;background:#333;border-radius:4px;margin-top:6px">
+                                <div style="width:{rel:.1f}%;height:100%;background:{BAND_COLORS[b]};border-radius:4px"></div>
                             </div>
-                            <div style="text-align:center;margin-top:6px;font-weight:700;color:#dcefff">{rel_pct:.1f}%</div>
+                            <div style="text-align:center;margin-top:4px;color:#dcefff;font-weight:600">
+                                {rel:.1f}%
+                            </div>
                         </div>
                         """,
                         unsafe_allow_html=True
                     )
-        else:
-            st.caption("⏳ Band powers will appear once data is received")
-
         st.divider()
 
+# ============================================================
+# RIGHT COLUMN – PREDICTION + EMOTIONAL STATE
+# ============================================================
+
 with right_col:
-    st.markdown("### Buffer Status")
-    if st.session_state.buffer_ready:
-        st.success("✅ Buffer Ready")
-    else:
-        st.info("📡 Collecting samples...")
-    
-    if st.session_state.last_buffer_status:
-        samp_df = pd.DataFrame(
-            list(st.session_state.last_buffer_status.items()),
-            columns=["Channel", "Samples"]
-        )
-        st.table(samp_df)
-    else:
-        st.caption("No buffer data yet")
-
     st.markdown("### Prediction")
-    if st.session_state.prediction_result:
-        res = st.session_state.prediction_result
-        
-        if "error" in res:
-            st.error(f"❌ {res['error']}")
-        else:
-            classes = res.get("classes", [])
-            probs = res.get("class_probabilities", [])
-            raw = res.get("prediction_raw")
-            label = raw
-            if classes and isinstance(raw, (int, float)):
-                try:
-                    label = classes[int(raw)]
-                except Exception:
-                    pass
-            conf = res.get("confidence", max(probs) if probs else None)
-            
-            st.markdown(f"**Prediction:** <span style='color:#9ff'>{label}</span>", unsafe_allow_html=True)
-            if conf is not None:
-                st.markdown(f"**Confidence:** {conf*100:.1f}%")
-                st.progress(min(1.0, float(conf)))
-            if probs and classes and len(probs) == len(classes):
-                dfp = pd.DataFrame({"class": classes, "prob": probs})
-                dfp = dfp.sort_values("prob", ascending=False)
-                st.table(dfp.style.format({"prob": "{:.3f}"}))
-            st.markdown("**Interpretation**")
-            st.write(res.get("explanation", "No explanation provided."))
+
+    res = st.session_state.prediction_result
+
+    if not res:
+        st.info("Run prediction to see results.")
+    elif "error" in res:
+        st.error(f"❌ {res['error']}")
     else:
-        st.info("Run prediction to see results")
+        raw = res.get("prediction_raw")
+        classes = res.get("classes", [])
+        probs = res.get("class_probabilities", [])
 
-    # st.markdown("### Data Flow")
-    # st.caption("ESP32 → WebSocket → Redis")
-    # st.caption("Dashboard ← HTTP Poll ← Redis")
-    # st.caption("🚀 No broadcast overhead")
+        # Convert raw index → label if possible
+        if classes and isinstance(raw, int) and 0 <= raw < len(classes):
+            pred_label = classes[raw]
+        else:
+            pred_label = str(raw) if raw is not None else "Unknown"
 
-# Auto-refresh
+        confidence = res.get("confidence", None)
+        if confidence is None:
+            # fallback: use max class probability if present
+            confidence = float(max(probs)) if probs else 0.0
+
+        st.markdown(f"""
+        **Prediction:** <span style='color:#9ff'>{pred_label}</span><br>
+        **Confidence:** {confidence*100:.1f}%
+        """, unsafe_allow_html=True)
+        st.progress(float(confidence))
+
+        # Band summary for interpretation
+        band_summary = summarize_bands_for_interpretation(channel_data)
+
+        # Long explanation (local)
+        # Determine dominant band
+        dom = sorted(band_summary.items(), key=lambda x: x[1]["mean_relative"], reverse=True)
+        top_band = dom[0][0] if dom else "unknown"
+
+        descriptive_lines = []
+        if pred_label=="1":
+            descriptive_lines.append(f"Healthy (confidence {confidence*100:.1f}%).")
+        else:
+            descriptive_lines.append(f"Detected disorder: **{pred_label}** (confidence {confidence*100:.1f}%).")
+
+        descriptive_lines.append(f"Dominant EEG band: **{top_band.upper()}**.")
+
+        mode = st.session_state.current_mode
+        if mode == "alzheimer":
+            descriptive_lines.append("Alzheimer-mode focuses on posterior rhythms.")
+            if top_band == "theta":
+                descriptive_lines.append("Elevated theta may indicate cognitive slowing or early decline.")
+            elif top_band == "delta":
+                descriptive_lines.append("Delta prominence can signal cortical dysfunction.")
+            elif top_band == "alpha":
+                descriptive_lines.append("Healthy alpha levels suggest preserved resting-state networks.")
+        elif mode == "parkinson":
+            descriptive_lines.append("Parkinson-mode examines motor circuit beta abnormalities.")
+            if top_band == "beta":
+                descriptive_lines.append("Beta dominance can be associated with motor rigidity patterns.")
+        elif mode == "depression":
+            descriptive_lines.append("Depression-mode analyzes frontal alpha asymmetry.")
+            if top_band == "alpha":
+                descriptive_lines.append("High alpha may reflect frontal hypoactivation.")
+        else:
+            descriptive_lines.append("General EEG interpretation applied.")
+
+        st.markdown("### Interpretation")
+        for l in descriptive_lines:
+            st.write(f"- {l}")
+
+        # Gemini short summary (clinical)
+        # try:
+        #     gem_prompt = (
+        #         f"You are an EEG analysis assistant.\nPrediction: {pred_label}\nConfidence: {confidence*100:.1f}%\n"
+        #         f"Band summary (means): {json.dumps(band_summary)}\n"
+        #         "Write a VERY SHORT clinical-style interpretation (2-3 lines, no filler).\n"
+        #         "Format:\n- Insight 1\n- Insight 2\n"
+        #     )
+        #     gem_url = (
+        #         f"https://generativelanguage.googleapis.com/v1beta/models/"
+        #         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        #     )
+        #     gem_headers = {"Content-Type": "application/json"}
+        #     gem_payload = {"contents": [{"parts": [{"text": gem_prompt}]}]}
+        #     gem_res = requests.post(gem_url, headers=gem_headers, json=gem_payload, timeout=6)
+        #     gem_data = gem_res.json()
+        #     gem_text = gem_data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        #     if not gem_text:
+        #         raise ValueError("Empty AI response")
+        #     gem_summary = gem_text.strip()
+        # except Exception as e:
+        #     gem_summary = f"- AI interpretation unavailable\n- Error: {e}"
+
+        # st.markdown("### AI Summary")
+        # st.info(gem_summary)
+
+    # -----------------------------
+    # Emotional-state (ALPHA-based)
+    # -----------------------------
+    st.markdown("### Emotional State (Alpha-based)")
+
+    # compute band summary even if no prediction ran
+    band_summary = summarize_bands_for_interpretation(channel_data)
+
+    alpha_mean = float(band_summary.get("alpha", {}).get("mean_relative", 0.0))
+    emotion_probs = compute_emotion_distribution(alpha_mean)
+
+    # Display percentages
+    for emo, p in emotion_probs.items():
+        st.write(f"**{emo}:** {p*100:.1f}%")
+
+    # # Show a small bar-like progress visualization
+    # for emo, p in emotion_probs.items():
+    #     st.progress(p)
+
+    # Gemini emotion micro-interpretation
+    gem_emotion_text = gemini_emotion_interpret(alpha_mean, emotion_probs)
+    st.markdown("### AI Emotional Interpretation")
+    st.info(gem_emotion_text)
+
+# ============================================================
+# AUTO REFRESH
+# ============================================================
+
 if st.session_state.auto_refresh:
-    time.sleep(float(st.session_state.refresh_rate))
+    # simple sleep + rerun cycle for live feel
+    time.sleep(st.session_state.refresh_rate)
     st.rerun()

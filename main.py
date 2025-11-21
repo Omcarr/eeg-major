@@ -1,14 +1,10 @@
 """
-main.py
-
-FastAPI WebSocket backend for multi-disorder EEG detection
-- Uses Redis to store latest 1024 samples per channel
-- ESP32 sends data via WebSocket
-- Dashboard polls Redis for live data
+FastAPI WebSocket backend for EEG multi-disorder detection
+Now fully compatible with your training script (17 features × 6 channels = 102 features).
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
 
@@ -25,12 +21,15 @@ import os
 import asyncio
 import redis.asyncio as redis
 
+# ----------------------------------------------------------
+# Logging
+# ----------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eeg-server")
 
-# -------------------------------------------
-# DETECTION MODES
-# -------------------------------------------
+# ----------------------------------------------------------
+# Modes and Channels
+# ----------------------------------------------------------
 DETECTION_MODES = {
     "alzheimer": ["Pz", "P3", "P4", "O1", "O2", "Cz"],
     "parkinson": ["Fz", "C3", "C4", "Pz", "T7", "T8"],
@@ -42,15 +41,39 @@ DETECTION_MODES = {
 }
 
 current_mode = {"mode": "alzheimer"}
-model_cache: Dict[str, Dict[str, Any]] = {}
-MODEL_DIR = "model"
 
+MODEL_DIR = "model"
+model_cache = {}
 redis_client = None
 
+# ==========================================================
+#  MATCHED FEATURE ORDER (17 FEATURES) — EXACT TRAINING ORDER
+# ==========================================================
+# Your training script sorts feature columns alphabetically.
+# After sorting, feature names appear in THIS order.
+FEATURE_ORDER = [
+    "alpha_power",
+    "alpha_relative",
+    "beta_power",
+    "beta_relative",
+    "delta_power",
+    "delta_relative",
+    "gamma_power",
+    "gamma_relative",
+    "kurtosis",
+    "mean",
+    "median",
+    "rms",
+    "skew",
+    "std",
+    "theta_power",
+    "theta_relative",
+    "total_power"
+]
 
-# -------------------------------------------
-# MODEL LOADING
-# -------------------------------------------
+# ==========================================================
+#  MODEL LOADING
+# ==========================================================
 def load_model_for_mode(mode: str):
     if mode in model_cache:
         return model_cache[mode]["model"], model_cache[mode]["scaler"]
@@ -58,32 +81,34 @@ def load_model_for_mode(mode: str):
     model_file = os.path.join(MODEL_DIR, f"{mode}_model.pkl")
     scaler_file = os.path.join(MODEL_DIR, f"{mode}_scaler.pkl")
 
-    if not os.path.exists(model_file) or not os.path.exists(scaler_file):
-        raise FileNotFoundError(f"Missing model for mode '{mode}'.")
+    if not os.path.exists(model_file):
+        raise FileNotFoundError(f"Model missing: {model_file}")
+    if not os.path.exists(scaler_file):
+        raise FileNotFoundError(f"Scaler missing: {scaler_file}")
 
     model = joblib.load(model_file)
     scaler = joblib.load(scaler_file)
-    model_cache[mode] = {"model": model, "scaler": scaler}
 
-    logger.info(f"Loaded model for mode={mode}")
+    model_cache[mode] = {"model": model, "scaler": scaler}
+    logger.info(f"✔ Loaded model for mode={mode}")
+
     return model, scaler
 
-
-# -------------------------------------------
-# REDIS EEG BUFFER
-# -------------------------------------------
+# ==========================================================
+#  REDIS EEG BUFFER
+# ==========================================================
 class RedisEEGBuffer:
-    def __init__(self, target_samples: int = 1024):
+    def __init__(self, target_samples=1024):
         self.target_samples = target_samples
-        self.channels = list(DETECTION_MODES[current_mode["mode"]])
+        self.channels = DETECTION_MODES[current_mode["mode"]]
         self._lock = asyncio.Lock()
 
-    async def set_mode(self, mode: str):
+    async def set_mode(self, mode):
         async with self._lock:
-            self.channels = list(DETECTION_MODES[mode])
-            logger.info(f"Buffer switched to mode={mode}")
+            self.channels = DETECTION_MODES[mode]
+            logger.info(f"EEG buffer switched to mode {mode}")
 
-    def _key(self, ch: str):
+    def _key(self, ch):
         return f"eeg:channel:{ch}"
 
     async def add_batch(self, batch: Dict[str, List[float]]):
@@ -91,12 +116,10 @@ class RedisEEGBuffer:
             return
 
         pipe = redis_client.pipeline()
-
         for ch, vals in batch.items():
             if ch not in self.channels:
                 continue
             key = self._key(ch)
-
             for v in vals:
                 pipe.lpush(key, float(v))
             pipe.ltrim(key, 0, self.target_samples - 1)
@@ -109,11 +132,8 @@ class RedisEEGBuffer:
 
         if channel:
             ch = channel
-        elif index is not None:
-            if 0 <= index < len(self.channels):
-                ch = self.channels[index]
-            else:
-                return
+        elif index is not None and index < len(self.channels):
+            ch = self.channels[index]
         else:
             return
 
@@ -123,30 +143,26 @@ class RedisEEGBuffer:
 
     async def is_ready(self):
         for ch in self.channels:
-            key = self._key(ch)
-            if await redis_client.llen(key) < self.target_samples:
+            if await redis_client.llen(self._key(ch)) < self.target_samples:
                 return False
         return True
 
     async def get_status(self):
-        status = {}
-        for ch in self.channels:
-            status[ch] = await redis_client.llen(self._key(ch))
-        return status
+        return {ch: await redis_client.llen(self._key(ch)) for ch in self.channels}
 
     async def get_data(self):
         data = {}
         for ch in self.channels:
-            values = await redis_client.lrange(self._key(ch), 0, self.target_samples - 1)
-            arr = np.array([float(v) for v in reversed(values)])
+            vals = await redis_client.lrange(self._key(ch), 0, self.target_samples - 1)
+            arr = np.array([float(v) for v in reversed(vals)])
             data[ch] = arr
         return data
 
     async def get_latest_samples(self, count=512):
         data = {}
         for ch in self.channels:
-            values = await redis_client.lrange(self._key(ch), 0, count - 1)
-            data[ch] = [float(v) for v in values]
+            vals = await redis_client.lrange(self._key(ch), 0, count - 1)
+            data[ch] = [float(v) for v in vals]
         return data
 
     async def clear(self):
@@ -154,26 +170,32 @@ class RedisEEGBuffer:
             await redis_client.delete(self._key(ch))
 
 
-eeg_buffer = RedisEEGBuffer(target_samples=1024)
+eeg_buffer = RedisEEGBuffer()
 
+# ==========================================================
+#  TRAINING-COMPATIBLE FEATURE EXTRACTOR (17 features)
+# ==========================================================
+def extract_features(eeg: np.ndarray):
+    if eeg.size == 0:
+        raise ValueError("Empty EEG array")
 
-# -------------------------------------------
-# FEATURE EXTRACTION
-# -------------------------------------------
-def extract_features(signal_data: np.ndarray):
     feats = {
-        "mean": float(np.mean(signal_data)),
-        "std": float(np.std(signal_data)),
-        "skew": float(skew(signal_data)),
-        "kurtosis": float(kurtosis(signal_data)),
-        "rms": float(np.sqrt(np.mean(signal_data ** 2))),
-        "median": float(np.median(signal_data)),
+        "mean": float(np.mean(eeg)),
+        "std": float(np.std(eeg)),
+        "skew": float(skew(eeg)),
+        "kurtosis": float(kurtosis(eeg)),
+        "rms": float(np.sqrt(np.mean(eeg ** 2))),
+        "median": float(np.median(eeg)),
     }
 
-    freqs, psd = signal.welch(signal_data, fs=128, nperseg=128)
-    total_power = max(float(np.trapz(psd, freqs)), 1e-12)
+    freqs, psd = signal.welch(eeg, fs=128, nperseg=min(128, len(eeg)))
+    total_power = float(np.trapz(psd, freqs))
+    if total_power <= 0:
+        total_power = 1e-12
 
-    bands = {
+    feats["total_power"] = total_power
+
+    BANDS = {
         "delta": (0.5, 4),
         "theta": (4, 8),
         "alpha": (8, 13),
@@ -181,60 +203,71 @@ def extract_features(signal_data: np.ndarray):
         "gamma": (30, 50),
     }
 
-    for name, (low, high) in bands.items():
-        idx = (freqs >= low) & (freqs <= high)
-        power = float(np.trapz(psd[idx], freqs[idx]))
-        feats[f"{name}_power"] = power
-        feats[f"{name}_relative"] = power / total_power
+    for band, (lo, hi) in BANDS.items():
+        idx = (freqs >= lo) & (freqs <= hi)
+        power = float(np.trapz(psd[idx], freqs[idx])) if idx.any() else 0.0
+        feats[f"{band}_power"] = power
+        feats[f"{band}_relative"] = power / total_power
 
     return feats
 
-
-# -------------------------------------------
-# FEATURE VECTORIZATION
-# -------------------------------------------
+# ==========================================================
+#  FEATURE VECTOR (Alphabetical order — EXACT MATCH)
+# ==========================================================
 def prepare_feature_vector(channel_data, mode):
-    expected = DETECTION_MODES[mode]
-
     feature_map = {}
-    for ch in expected:
+
+    for ch in DETECTION_MODES[mode]:
         feats = extract_features(channel_data[ch])
-        for f, v in feats.items():
-            feature_map[f"{ch}_{f}"] = v
+        for f in FEATURE_ORDER:
+            feature_map[f"{ch}_{f}"] = feats[f]
 
-    keys = sorted(feature_map)
-    x = np.array([feature_map[k] for k in keys]).reshape(1, -1)
-    return x, keys
+    ordered_keys = sorted(feature_map.keys())  # EXACT match to training
+    x = np.array([feature_map[k] for k in ordered_keys]).reshape(1, -1)
 
+    return x, ordered_keys
 
+# ==========================================================
+#  PREDICTION
+# ==========================================================
 def predict_mode_from_data(channel_data, mode):
     model, scaler = load_model_for_mode(mode)
-    fv, keys = prepare_feature_vector(channel_data, mode)
-    fv_scaled = scaler.transform(fv)
-    pred = model.predict(fv_scaled)[0]
 
-    probs = None
+    fv, keys = prepare_feature_vector(channel_data, mode)
+
+    expected = scaler.n_features_in_
+    if fv.shape[1] != expected:
+        raise ValueError(f"Feature mismatch: got {fv.shape[1]}, expected {expected}")
+
+    fv_scaled = scaler.transform(fv)
+
+    pred = int(model.predict(fv_scaled)[0])
+
     try:
         probs = model.predict_proba(fv_scaled)[0].tolist()
+        conf = max(probs)
     except:
-        pass
-
-    return {
+        probs, conf = None, None
+        
+    result= {
         "mode": mode,
-        "prediction_raw": int(pred),
+        "prediction_raw": pred,
         "class_probabilities": probs,
-        "confidence": max(probs) if probs else None,
+        "confidence": conf,
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "channels_used": DETECTION_MODES[mode],
+        "feature_count": fv.shape[1]
     }
 
+    print(result)
+    return result
 
+# ==========================================================
+#  LIFESPAN
+# ==========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client
-
-    logger.info("Starting EEG API with Redis")
-
     redis_client = redis.Redis(
         host=os.getenv("REDIS_HOST", "localhost"),
         port=int(os.getenv("REDIS_PORT", 6379)),
@@ -242,30 +275,21 @@ async def lifespan(app: FastAPI):
     )
 
     await redis_client.ping()
-    logger.info("Connected to Redis")
+    logger.info("✔ Connected to Redis")
 
-    # CLEAR EEG keys on startup
+    # clear buffers
     keys = await redis_client.keys("eeg:channel:*")
     if keys:
         await redis_client.delete(*keys)
-        logger.info("Cleared EEG buffers on startup")
+        logger.info("Cleared old EEG buffer data")
 
-    # Preload model
-    try:
-        load_model_for_mode(current_mode["mode"])
-    except Exception as e:
-        logger.warning(f"Model preload failed: {e}")
+    yield
 
-    yield  # REQUIRED
-
-    # Cleanup
     await redis_client.close()
-    logger.info("Redis connection closed")
 
-
-# -------------------------------------------
-# FASTAPI APP
-# -------------------------------------------
+# ==========================================================
+#  FASTAPI APP
+# ==========================================================
 app = FastAPI(lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
 
@@ -276,50 +300,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# -------------------------------------------
-# HTTP ROUTES
-# -------------------------------------------
+# ==========================================================
+#  ROUTES
+# ==========================================================
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("eeg_dashboard.html", {"request": request})
 
-
 @app.get("/api/mode")
 async def api_get_mode():
-    return {"mode": current_mode["mode"], "channels": DETECTION_MODES[current_mode["mode"]]}
-
+    return {"mode": current_mode["mode"]}
 
 @app.post("/api/set_mode/{mode}")
 async def api_set_mode(mode: str):
-    mode = mode.lower()
     if mode not in DETECTION_MODES:
-        raise HTTPException(400, f"Unknown mode '{mode}'")
-
+        raise HTTPException(400, "Invalid mode")
     current_mode["mode"] = mode
     await eeg_buffer.set_mode(mode)
-    return {"status": "ok", "mode": mode}
-
+    return {"status": "ok"}
 
 @app.get("/api/buffer")
-async def api_get_buffer():
-    return {"ready": await eeg_buffer.is_ready(), "samples": await eeg_buffer.get_status()}
-
+async def api_buffer():
+    return {
+        "ready": await eeg_buffer.is_ready(),
+        "samples": await eeg_buffer.get_status()
+    }
 
 @app.get("/api/live_data")
 async def api_live(samples: int = 512):
     return {
         "data": await eeg_buffer.get_latest_samples(samples),
         "ready": await eeg_buffer.is_ready(),
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.utcnow().isoformat() + "Z"
     }
-
 
 @app.post("/api/clear")
 async def api_clear():
     await eeg_buffer.clear()
     return {"status": "cleared"}
-
 
 @app.post("/api/predict")
 async def api_predict():
@@ -327,12 +345,15 @@ async def api_predict():
         raise HTTPException(400, "Buffer not ready")
 
     data = await eeg_buffer.get_data()
-    return predict_mode_from_data(data, current_mode["mode"])
+    try:
+        return predict_mode_from_data(data, current_mode["mode"])
+    except Exception as e:
+        logger.exception("Prediction failed")
+        raise HTTPException(500, f"Prediction failed: {e}")
 
-
-# -------------------------------------------
-# WEBSOCKET FOR ESP32
-# -------------------------------------------
+# ==========================================================
+#  WEBSOCKET (ESP32)
+# ==========================================================
 @app.websocket("/ws/eeg")
 async def ws_eeg(ws: WebSocket):
     await ws.accept()
@@ -342,30 +363,41 @@ async def ws_eeg(ws: WebSocket):
         while True:
             msg = await ws.receive_json()
 
-            if msg.get("type") == "batch":
+            t = msg.get("type")
+
+            if t == "batch":
                 print(msg["data"])
                 await eeg_buffer.add_batch(msg["data"])
                 ready = await eeg_buffer.is_ready()
                 await ws.send_json({"type": "ack", "ready": ready})
 
-            elif msg.get("type") == "sample":
-                await eeg_buffer.add_sample(channel=msg.get("channel"), index=msg.get("index"), value=msg["value"])
+            elif t == "sample":
+                await eeg_buffer.add_sample(
+                    channel=msg.get("channel"),
+                    index=msg.get("index"),
+                    value=msg["value"]
+                )
                 await ws.send_json({"type": "ack"})
 
-            elif msg.get("type") == "predict":
+            elif t == "predict":
                 if not await eeg_buffer.is_ready():
                     await ws.send_json({"type": "error", "msg": "Buffer not ready"})
                     continue
+
                 data = await eeg_buffer.get_data()
-                result = predict_mode_from_data(data, current_mode["mode"])
-                await ws.send_json({"type": "prediction", "result": result})
+                try:
+                    res = predict_mode_from_data(data, current_mode["mode"])
+                    await ws.send_json({"type": "prediction", "result": res})
+                except Exception as e:
+                    logger.exception("WS prediction error")
+                    await ws.send_json({"type": "error", "msg": str(e)})
 
     except WebSocketDisconnect:
         logger.info("ESP32 disconnected")
 
 
-# -------------------------------------------
-# MAIN ENTRY
-# -------------------------------------------
+# ==========================================================
+#  MAIN ENTRY
+# ==========================================================
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
